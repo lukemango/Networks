@@ -15,6 +15,7 @@ import me.mrCookieSlime.Slimefun.api.BlockStorage;
 import me.mrCookieSlime.Slimefun.api.inventory.BlockMenu;
 import org.bukkit.Bukkit;
 import org.bukkit.Color;
+import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.OfflinePlayer;
 import org.bukkit.Particle;
@@ -34,7 +35,7 @@ import java.util.UUID;
 public class NetworkVanillaPusher extends NetworkDirectional {
 
     private static final int[] BACKGROUND_SLOTS = new int[]{
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 15, 16, 17, 18, 20, 22, 23, 24, 26, 27, 28, 30, 31, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 15, 16, 17, 18, 20, 22, 23, 24, 26, 27, 28, 30, 31, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44
     };
     private static final int INPUT_SLOT = 25;
     private static final int NORTH_SLOT = 11;
@@ -43,6 +44,14 @@ public class NetworkVanillaPusher extends NetworkDirectional {
     private static final int WEST_SLOT = 19;
     private static final int UP_SLOT = 14;
     private static final int DOWN_SLOT = 32;
+
+    private static final boolean WILDCHESTS_ENABLED = Networks.getSupportedPluginManager().isWildChests();
+    private static final boolean DEBUG_ENABLED = Networks.getInstance().getConfig().getBoolean("debug", false);
+
+    private UUID cachedOwnerUUID;
+    private Boolean isWildChest;
+    private int tickCounter = 0;
+    private boolean hasPermission = true;
 
     public NetworkVanillaPusher(ItemGroup itemGroup,
                                 SlimefunItemStack item,
@@ -57,12 +66,17 @@ public class NetworkVanillaPusher extends NetworkDirectional {
     protected void onTick(@Nullable BlockMenu blockMenu, @Nonnull Block block) {
         super.onTick(blockMenu, block);
         if (blockMenu != null) {
-            tryPushItem(blockMenu);
+            final NodeDefinition definition = NetworkStorage.getAllNetworkObjects().get(blockMenu.getLocation());
+            tryPushItem(blockMenu, definition);
         }
     }
 
-    private void tryPushItem(@Nonnull BlockMenu blockMenu) {
-        final NodeDefinition definition = NetworkStorage.getAllNetworkObjects().get(blockMenu.getLocation());
+    private void tryPushItem(@Nonnull BlockMenu blockMenu, @Nullable NodeDefinition definition) {
+        // Early exit if no item to push
+        final ItemStack stack = blockMenu.getItemInSlot(INPUT_SLOT);
+        if (stack == null || stack.getType() == Material.AIR) {
+            return;
+        }
 
         if (definition == null || definition.getNode() == null) {
             return;
@@ -71,55 +85,70 @@ public class NetworkVanillaPusher extends NetworkDirectional {
         final BlockFace direction = getCurrentDirection(blockMenu);
         final Block block = blockMenu.getBlock();
         final Block targetBlock = blockMenu.getBlock().getRelative(direction);
-        final UUID uuid = UUID.fromString(BlockStorage.getLocationInfo(block.getLocation(), OWNER_KEY));
-        final OfflinePlayer offlinePlayer = Bukkit.getOfflinePlayer(uuid);
 
-        if (!Slimefun.getProtectionManager().hasPermission(offlinePlayer, targetBlock, Interaction.INTERACT_BLOCK)) {
+        // Cache owner UUID
+        if (cachedOwnerUUID == null) {
+            String uuidString = BlockStorage.getLocationInfo(block.getLocation(), OWNER_KEY);
+            cachedOwnerUUID = uuidString != null ? UUID.fromString(uuidString) : null;
+        }
+        if (cachedOwnerUUID == null) {
+            return;
+        }
+
+        final OfflinePlayer offlinePlayer = Bukkit.getOfflinePlayer(cachedOwnerUUID);
+
+        // Throttle permission checks
+        if (tickCounter % 5 == 0) {
+            hasPermission = Slimefun.getProtectionManager().hasPermission(offlinePlayer, targetBlock, Interaction.INTERACT_BLOCK);
+        }
+        tickCounter++;
+
+        if (!hasPermission) {
             return;
         }
 
         final BlockState blockState = targetBlock.getState();
-
         if (!(blockState instanceof InventoryHolder holder)) {
             return;
         }
 
         final Inventory inventory = holder.getInventory();
-        final ItemStack stack = blockMenu.getItemInSlot(INPUT_SLOT);
 
-        if (stack == null || stack.getType() == Material.AIR) {
-            return;
+        // Cache WildChests check
+        if (WILDCHESTS_ENABLED) {
+            if (isWildChest == null) {
+                isWildChest = WildChestsAPI.getChest(targetBlock.getLocation()) != null;
+            }
+        } else {
+            isWildChest = false;
         }
 
-        boolean wildChests = Networks.getSupportedPluginManager().isWildChests();
-        boolean isChest = wildChests && WildChestsAPI.getChest(targetBlock.getLocation()) != null;
-
-        sendDebugMessage(block.getLocation(), "WildChests detected: " + wildChests);
-        sendDebugMessage(block.getLocation(), "Block detected as chest: " + isChest);
+        sendDebugMessage(block.getLocation(), "WildChests detected: " + WILDCHESTS_ENABLED);
+        sendDebugMessage(block.getLocation(), "Block detected as chest: " + isWildChest);
 
         if (inventory instanceof FurnaceInventory furnace) {
             handleFurnace(stack, furnace);
         } else if (inventory instanceof BrewerInventory brewer) {
             handleBrewingStand(stack, brewer);
-        } else if (wildChests && isChest) {
+        } else if (WILDCHESTS_ENABLED && isWildChest) {
             sendDebugMessage(block.getLocation(), "WildChest test failed, escaping");
             return;
-        } else if (InvUtils.fits(holder.getInventory(), stack)) {
+        } else {
             sendDebugMessage(block.getLocation(), "WildChest test passed.");
-            holder.getInventory().addItem(stack);
-            stack.setAmount(0);
+            ItemStack remaining = holder.getInventory().addItem(stack.clone()).get(0);
+            if (remaining == null || remaining.getAmount() == 0) {
+                stack.setAmount(0); // All items were added
+            } else {
+                stack.setAmount(remaining.getAmount()); // Update remaining amount
+            }
         }
     }
 
     private void handleFurnace(@Nonnull ItemStack stack, @Nonnull FurnaceInventory furnace) {
-        if (stack.getType().isFuel()
-            && (furnace.getFuel() == null || furnace.getFuel().getType() == Material.AIR)
-        ) {
+        if (stack.getType().isFuel() && (furnace.getFuel() == null || furnace.getFuel().getType() == Material.AIR)) {
             furnace.setFuel(stack.clone());
             stack.setAmount(0);
-        } else if (!stack.getType().isFuel()
-            && (furnace.getSmelting() == null || furnace.getSmelting().getType() == Material.AIR)
-        ) {
+        } else if (!stack.getType().isFuel() && (furnace.getSmelting() == null || furnace.getSmelting().getType() == Material.AIR)) {
             furnace.setSmelting(stack.clone());
             stack.setAmount(0);
         }
@@ -129,6 +158,9 @@ public class NetworkVanillaPusher extends NetworkDirectional {
         if (stack.getType() == Material.BLAZE_POWDER) {
             if (brewer.getFuel() == null || brewer.getFuel().getType() == Material.AIR) {
                 brewer.setFuel(stack.clone());
+                stack.setAmount(0);
+            } else if (brewer.getIngredient() == null || brewer.getIngredient().getType() == Material.AIR) {
+                brewer.setIngredient(stack.clone());
                 stack.setAmount(0);
             }
         } else if (stack.getType() == Material.POTION) {
@@ -145,6 +177,12 @@ public class NetworkVanillaPusher extends NetworkDirectional {
         } else if (brewer.getIngredient() == null || brewer.getIngredient().getType() == Material.AIR) {
             brewer.setIngredient(stack.clone());
             stack.setAmount(0);
+        }
+    }
+
+    public void sendDebugMessage(Location location, String message) {
+        if (DEBUG_ENABLED) {
+            Networks.getInstance().getLogger().info("[DEBUG] " + location + ": " + message);
         }
     }
 
