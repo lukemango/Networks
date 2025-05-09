@@ -14,6 +14,7 @@ import me.mrCookieSlime.Slimefun.api.BlockStorage;
 import me.mrCookieSlime.Slimefun.api.inventory.BlockMenu;
 import org.bukkit.Bukkit;
 import org.bukkit.Color;
+import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.OfflinePlayer;
 import org.bukkit.Particle;
@@ -33,10 +34,7 @@ import javax.annotation.Nullable;
 import java.util.UUID;
 
 public class NetworkVanillaGrabber extends NetworkDirectional {
-
-    private static final int[] BACKGROUND_SLOTS = new int[]{
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 15, 16, 17, 18, 20, 22, 23, 24, 26, 27, 28, 30, 31, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44
-    };
+    private static final int[] BACKGROUND_SLOTS = new int[]{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 15, 16, 17, 18, 20, 22, 23, 24, 26, 27, 28, 30, 31, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44};
     private static final int OUTPUT_SLOT = 25;
     private static final int NORTH_SLOT = 11;
     private static final int SOUTH_SLOT = 29;
@@ -44,18 +42,29 @@ public class NetworkVanillaGrabber extends NetworkDirectional {
     private static final int WEST_SLOT = 19;
     private static final int UP_SLOT = 14;
     private static final int DOWN_SLOT = 32;
+    private static final int TICK_DELAY = 5; // Process every 5 ticks (0.25 seconds)
+    private static final boolean DEBUG_ENABLED = false; // Toggle for debug messages
 
-    public NetworkVanillaGrabber(ItemGroup itemGroup,
-                                 SlimefunItemStack item,
-                                 RecipeType recipeType,
-                                 ItemStack[] recipe
-    ) {
+    private int tickCounter = 0;
+    private Boolean cachedPermission = null;
+    private Block cachedTargetBlock = null;
+    private OfflinePlayer cachedPlayer = null;
+    private Boolean cachedWildChests = null;
+    private Boolean cachedIsChest = null;
+    private Block cachedWildChestsBlock = null;
+
+    public NetworkVanillaGrabber(ItemGroup itemGroup, SlimefunItemStack item, RecipeType recipeType, ItemStack[] recipe) {
         super(itemGroup, item, recipeType, recipe, NodeType.PUSHER);
         this.getSlotsToDrop().add(OUTPUT_SLOT);
     }
 
     @Override
     protected void onTick(@Nullable BlockMenu blockMenu, @Nonnull Block block) {
+        if (++tickCounter < TICK_DELAY) {
+            return;
+        }
+        tickCounter = 0;
+
         super.onTick(blockMenu, block);
         if (blockMenu != null) {
             tryGrabItem(blockMenu);
@@ -63,15 +72,12 @@ public class NetworkVanillaGrabber extends NetworkDirectional {
     }
 
     private void tryGrabItem(@Nonnull BlockMenu blockMenu) {
-
         final ItemStack itemInSlot = blockMenu.getItemInSlot(OUTPUT_SLOT);
-
         if (itemInSlot != null && itemInSlot.getType() != Material.AIR) {
             return;
         }
 
         final NodeDefinition definition = NetworkStorage.getAllNetworkObjects().get(blockMenu.getLocation());
-
         if (definition == null || definition.getNode() == null) {
             return;
         }
@@ -82,28 +88,36 @@ public class NetworkVanillaGrabber extends NetworkDirectional {
         final UUID uuid = UUID.fromString(BlockStorage.getLocationInfo(block.getLocation(), OWNER_KEY));
         final OfflinePlayer offlinePlayer = Bukkit.getOfflinePlayer(uuid);
 
-        if (!Slimefun.getProtectionManager().hasPermission(offlinePlayer, targetBlock, Interaction.INTERACT_BLOCK)) {
+        if (cachedTargetBlock != targetBlock || cachedPlayer != offlinePlayer || cachedPermission == null) {
+            cachedPermission = Slimefun.getProtectionManager().hasPermission(offlinePlayer, targetBlock, Interaction.INTERACT_BLOCK);
+            cachedTargetBlock = targetBlock;
+            cachedPlayer = offlinePlayer;
+        }
+
+        if (!cachedPermission) {
             return;
         }
 
         final BlockState blockState = targetBlock.getState();
-
         if (!(blockState instanceof InventoryHolder holder)) {
             return;
         }
 
-        boolean wildChests = Networks.getSupportedPluginManager().isWildChests();
-        boolean isChest = wildChests && WildChestsAPI.getChest(targetBlock.getLocation()) != null;
+        if (cachedWildChestsBlock != targetBlock || cachedWildChests == null || cachedIsChest == null) {
+            cachedWildChests = Networks.getSupportedPluginManager().isWildChests();
+            cachedIsChest = cachedWildChests && WildChestsAPI.getChest(targetBlock.getLocation()) != null;
+            cachedWildChestsBlock = targetBlock;
+        }
 
-        sendDebugMessage(block.getLocation(), "WildChests detected: " + wildChests);
-        sendDebugMessage(block.getLocation(), "Block detected as chest: " + isChest);
+        sendDebugMessageIfEnabled(block.getLocation(), "WildChests detected: " + cachedWildChests);
+        sendDebugMessageIfEnabled(block.getLocation(), "Block detected as chest: " + cachedIsChest);
 
-        if (wildChests && isChest) {
-            sendDebugMessage(block.getLocation(), "WildChest test failed, escaping");
+        if (cachedWildChests && cachedIsChest) {
+            sendDebugMessageIfEnabled(block.getLocation(), "WildChest test failed, escaping");
             return;
         }
 
-        sendDebugMessage(block.getLocation(), "WildChest test passed.");
+        sendDebugMessageIfEnabled(block.getLocation(), "WildChest test passed.");
         final Inventory inventory = holder.getInventory();
 
         if (inventory instanceof FurnaceInventory furnaceInventory) {
@@ -114,13 +128,13 @@ public class NetworkVanillaGrabber extends NetworkDirectional {
             if (furnaceInventoryFuel != null && furnaceInventoryFuel.getType() == Material.BUCKET) {
                 grabItem(blockMenu, furnaceInventoryFuel);
             }
-
         } else if (inventory instanceof BrewerInventory brewerInventory) {
             for (int i = 0; i < 3; i++) {
                 final ItemStack stack = brewerInventory.getContents()[i];
                 if (stack != null && stack.getType() == Material.POTION) {
                     final PotionMeta potionMeta = (PotionMeta) stack.getItemMeta();
-                    if (potionMeta.getBasePotionData().getType() != PotionType.WATER) {
+                    // Check if the potion is not a water potion
+                    if (potionMeta != null && potionMeta.getBasePotionType() != PotionType.WATER) {
                         grabItem(blockMenu, stack);
                         return;
                     }
@@ -129,7 +143,7 @@ public class NetworkVanillaGrabber extends NetworkDirectional {
         } else {
             for (ItemStack stack : inventory.getContents()) {
                 if (grabItem(blockMenu, stack)) {
-                    return;
+                    break;
                 }
             }
         }
@@ -140,9 +154,23 @@ public class NetworkVanillaGrabber extends NetworkDirectional {
             blockMenu.replaceExistingItem(OUTPUT_SLOT, stack.clone());
             stack.setAmount(0);
             return true;
-        } else {
-            return false;
         }
+        return false;
+    }
+
+    private void sendDebugMessageIfEnabled(Location location, String message) {
+        if (DEBUG_ENABLED) {
+            sendDebugMessage(location, message);
+        }
+    }
+
+    public void resetPermissionCache() {
+        cachedPermission = null;
+        cachedTargetBlock = null;
+        cachedPlayer = null;
+        cachedWildChests = null;
+        cachedIsChest = null;
+        cachedWildChestsBlock = null;
     }
 
     @Nonnull
